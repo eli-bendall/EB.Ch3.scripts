@@ -1,0 +1,1423 @@
+---
+title: "juvenile_mortality"
+author: "Eli Bendall & Micheal Bedward"
+date: "02/08/2020"
+output: word_document
+---
+
+```{r setup, include=TRUE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=8, fig.height=6)
+
+library(here)
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(readxl)
+library(stringr)
+library(tidyr)
+library(bayesplot)
+library(brms)
+library(tidybayes)
+library(RColorBrewer)
+library(rstan)
+library(splines)
+library(forcats)
+#library(ggthemes)
+library(ggpubr)
+#library(egg)
+
+#These options help Stan run faster:
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# Make sure the scales package is available (it should be if ggplot is installed)
+requireNamespace("scales")
+
+# Default graph theme - white background
+theme_set( theme_bw() )
+
+set.seed(42)
+
+
+# Set to TRUE to force models to be refitted
+REFIT_MODELS <- FALSE
+
+
+# Create a folder for fitted models if one does not already exist
+FittedModelsPath <- here("fitted_models")
+if (!dir.exists(FittedModelsPath)) {
+  dir.create(FittedModelsPath)
+}
+
+
+# Load brms if it is installed (requires Stan software and the rstan package).
+# If not installed, HAS_BRMS will be set to FALSE.
+HAS_BRMS <- suppressWarnings(
+  require("brms", quietly = TRUE)
+)
+
+
+###### Some helper functions #####
+
+# Calculate standard page sizes
+pagesize <- function(size = c("A4", "A3", "A2", "A1", "A0"), 
+                     orientation = c("portrait", "landscape"),
+                     units = c("cm", "mm")) {
+  
+  size <- match.arg(size)
+  orientation <- match.arg(orientation)
+  units <- match.arg(units)
+  
+  alpha <- 1000 * 2^(1/4)
+  i <- as.integer(substr(size, 2, 2))
+  long <- alpha * 2^(-i/2)
+  
+  page <- switch(
+    orientation,
+    portrait = c(width = long / sqrt(2), height = long),
+    landscape = c(width = long, height = long / sqrt(2))
+  )
+  
+  page <- round(page)
+  if (units == "cm") page <- page / 10
+  
+  page <- c(as.list(page), units = units)
+  class(page) <- "pagesize"
+  
+  page
+}
+
+
+
+# Save a graph to a PDF file
+gg_pdf <- function(plot, filename, size = pagesize("A4", "landscape", "cm")) {
+  
+  if (!inherits(size, "pagesize")) stop("The size argument should be a pagesize (list) object")
+  
+  ggsave(
+    filename, 
+    plot, 
+    width = size$width,
+    height = size$height,
+    units = size$units)
+}
+
+
+# Calculate highest posterior density interval for a vector of values
+hpdi.vec <- function (x, prob = 0.95) {
+  n <- length(x)
+  if (n <= 1) stop("x must have more than 1 element")
+  x <- sort(x)
+
+  gap <- max(1, min(n - 1, round(n * prob)))
+  init <- 1:(n - gap)
+
+  inds <- which.min(x[init + gap] - x[init])
+
+  out <- c(lower = x[inds], upper = x[inds + gap])
+  out
+}
+
+
+```
+
+## Prepare data 
+
+All field data are in a single Excel workbook.
+
+```{r}
+
+ExcelPathData <- here("data_raw", "Eli_field_data30thMAY.xlsx")
+
+ExcelPathBarkTypes <- here("data_raw", "bark3.xlsx")
+
+```
+
+
+### Resprouting levels
+
+This look-up table relates field codes for topkill to aggregated classes that will be used for modelling.
+
+```{r}
+
+# Resprout model levels in order of response severity (low to high)
+topkillLevels <- data.frame(
+  level = c('intact',  'canopy',  'stem',    'tree', 'topkill'),
+  
+  label = c('success', 'success', 'success', 'fail', 'fail') )
+
+knitr::kable(topkillLevels)
+
+```
+
+### DBH class definitions (to be used for checking)
+
+```{r}
+
+DBH.classes <- data.frame(
+  class = 1:4,
+  dbh.min = c(0, 2.5, 10, 20)
+)
+
+knitr::kable(DBH.classes)
+
+```
+
+
+### setop dataframe
+
+```{r}
+
+dat12 <- read_excel(ExcelPathData, sheet = "class1_2", guess_max = 3066) %>%
+  
+  select(siteid = site_id,
+         treeid = tree_id,
+         species,
+         dbhclass = class,
+         dbh:dbh5,
+         topkill) %>%
+  
+  # Add Excel row number (useful to locate records for checking)
+  mutate(xlrow = row_number() + 1) %>%
+  
+  # attach levels/labels
+  mutate(topkill = factor(topkill, ordered = TRUE,
+                      levels = topkillLevels$level,
+                      labels = topkillLevels$label)) %>%
+
+
+  #filter missing values
+  filter(!is.na(topkill))
+
+dat12$dbh <- as.numeric(as.character(dat12$dbh))
+
+  
+
+```
+
+
+Check for missing values. It is okay to have NAs in the additional dbh columns: dbh2...dbh7
+
+```{r}
+colSums( is.na(dat12) )
+```
+
+
+For multi-stemmed trees, we calculate an equivalent single-stem diameter based on the sum of the areas of the multiple stems.
+
+```{r}
+
+# Function to calculate equivalent single-stem DBH
+fn_dbh <- function(...) {
+  dbhs <- cbind(...)
+  sqrt( rowSums(dbhs^2, na.rm = TRUE) )
+}
+
+dat12 <- dat12 %>% 
+  dplyr::mutate(dbhsingle = fn_dbh(dbh, dbh2, dbh3, dbh4, dbh5)) %>%
+  
+  ## delete unused DBH columns
+  
+  dplyr::select(-(dbh:dbh5))
+
+```
+
+
+Check for any trees where the single-stem DBH is below the lower threshold for the recorded DBH class. This might indicate a data entry error. For multi-stem trees, the calculated single-stem diameter is always greater than the largest individual stem diameter.
+
+```{r}
+
+small12 <- dat12 %>%
+  left_join(DBH.classes, by = c("dbhclass" = "class")) %>%
+  filter(dbhsingle < dbh.min) %>%
+  select(-dbh.min)
+
+if (nrow(small12) > 0) {
+  knitr::kable(small12)
+} else {
+  cat("No trees with suspect diameters found")
+}
+
+```
+
+*TODO* Eli will check the above records. For the moment we will discard them. ### UPDATED - checked by Eli, some records were fixed for large trees, some records for small trees were missing observations
+
+```{r}
+
+if (nrow(small12) > 0) {
+  dat12 <- dat12 %>%
+    filter( !(xlrow %in% small12$xlrow) )
+}
+
+```
+
+
+## Stumps and logs
+
+```{r}
+
+ 
+datST <- read_excel(ExcelPathData, sheet = "class5", guess_max = 2500) %>%
+  select(siteid = site_id,
+         treeid = tree_id,
+         species,
+         dbhclass = class,
+         dbh:dbh5,
+         topkill = topkill_alt) %>%
+  
+  #Add Excel row number (useful to locate records for checking)
+  mutate(xlrow = row_number() + 1) %>%
+    
+  
+  # NOTE: Here we only want records for stumpsthat have been deteermined to be topkilled     during the last fire, i.e. 'topkill_alt'. 
+  filter(topkill == "topkill") %>%
+
+  
+  # Attach labels/levels
+  mutate(topkill = factor(topkill, ordered = TRUE,
+                      levels = topkillLevels$level,
+                      labels = topkillLevels$label)) %>%
+
+  # Filter out missing records, NOTE: for some reason in some places there is an error when   'filter' is used, so here it must be 'dplyr::filter'.
+  dplyr::filter(!is.na(topkill)) %>%
+  dplyr::filter(!is.na(dbh)) %>%
+  dplyr::filter(dbhclass < 3)
+
+```
+
+## Check for missing values
+
+```{r}
+
+colSums( is.na(datST) )
+```
+## Calculate single-stem DBH
+
+```{r}
+
+datST <- datST %>% 
+  mutate(dbhsingle = fn_dbh(dbh, dbh2, dbh3, dbh4, dbh5)) %>%
+         
+## NOTE: dbh column has 3 missing values ## Update: Double check this, but should be fixed 
+  
+  
+## delete unused DBH columns
+
+dplyr::select(-(dbh:dbh5))
+```
+
+
+```{r}
+
+smallST <- datST %>%
+  left_join(DBH.classes, by = c("dbhclass" = "class")) %>%
+  filter(dbhsingle < dbh.min) %>%
+  select(-dbh.min)
+
+if (nrow(smallST) > 0) {
+  knitr::kable(smallST)
+} else {
+  cat("No trees with suspect diameters found")
+}
+
+```
+
+Eli advises that these zero diameters are to be treated as missing values. We will discard them here:
+
+```{r}
+
+datST <- datST %>%
+  filter( !(xlrow %in% smallST$xlrow) )
+
+```
+
+
+### Combine initial data sets for large and small trees
+
+
+```{r}
+na0 <- function(x) ifelse(is.na(x), 0, x)
+
+DAT.all.trees <- bind_rows(
+  mutate(dat12, source = "dat12"),
+  mutate(datST, source = "datST")) %>%
+  
+  # Re-arrange columns a bit
+  select(xlrow, treeid, species, starts_with("dbh"), everything()) %>%
+  
+  
+  # Guard against mis-matched species names due to
+  # case or spaces
+  mutate(species = str_to_title( str_remove_all(species, "\\s+") ) )
+
+```
+
+Check for missing values
+
+```{r}
+
+colSums( is.na(DAT.all.trees) )
+
+```
+
+
+This generates a summary table showing the number of occurrences (sites) for each DBH class by species.
+
+```{r}
+
+species.summary <- DAT.all.trees %>%
+  group_by(species, dbhclass) %>%
+  summarize(ntrees = n_distinct(treeid)) %>%
+  
+  mutate(dbhclass = paste0("class", dbhclass)) %>%
+  tidyr::spread(dbhclass, ntrees, fill = 0) %>%
+
+  arrange(species)
+
+```
+
+
+### Species for modelling
+
+Species category "u" means unknown eucalypt. There are some cases in the tree data (both dat34 and dat12) that need to be checked. For the log data we want to include the "u" cases in the modelling data set.
+
+### Update, species entries have been checked, confirm then "u" must be kept in addition to the fake species "E. unkn", which was created for unknown species of charred logs (i.e. bark type = 'burnt').
+
+```{r}
+
+excluded <- c("A.litt", "A.toru", "B.serr", "C.apet", "C.australis", "Other", "other", "A. deal")
+
+species.summary <- species.summary %>%
+  mutate(model = !(species %in% excluded) )
+
+```
+
+
+### Prepare data for modelling
+
+We will exclude the smallest trees (DBH class 1).
+
+```{r}
+
+dat.model <- DAT.all.trees %>%
+  
+  # Subset to species to model
+  left_join(species.summary %>% select(species, model), 
+            by = "species") %>%
+  
+  filter(model) %>%
+  select(-model)
+  
+```
+
+
+Summary table of response frequencies by species:
+
+```{r}
+
+with(dat.model, table(species, topkill))
+
+```
+
+
+Add site attributes. 
+
+*Note:* this relies on the code in document `import_site_data.Rmd` being run first.
+
+```{r}
+
+load( here("data", "sites.RData") )
+
+dat.model <- dat.model %>%
+  left_join(
+    DAT.sites %>% select(siteid, vegtype,
+                         fireclass, firecount,
+                         droughtclass, droughtclass2, spei,
+                         easting, northing),
+    
+    by = "siteid"
+  )
+
+```
+
+
+Define factors for variables to be used in the model and convert "NA" values of barktype to true NAs.
+
+```{r}
+
+dat.model <- dat.model %>%
+  
+  mutate(dbhclass = factor(dbhclass),
+         siteid = factor(siteid))
+
+```
+
+
+## weighting values applied due to mismatched plot sizes between logs and standing trees
+
+```{r}
+dat.model <- dat.model %>%
+  mutate(
+    weights = case_when(
+         dbhclass == "1" & source == "dat12" ~ 1,
+         dbhclass == "1" & source == "datST" ~ 0.25,
+         dbhclass == "2" & source == "dat12" ~ 1,
+         dbhclass == "2" & source == "datST" ~ 0.25))
+
+```
+
+## create interaction term for fire and drought
+
+```{r}
+dat.model$firedrought <- interaction(
+  dat.model$fireclass, dat.model$droughtclass)
+```
+
+```{r}
+
+dat.model.DSF <- dat.model %>%
+  filter(vegtype == "dsf")
+
+
+```
+
+
+### model code
+
+```{r}
+
+library(future)
+
+plan(multiprocess)
+
+PathBrmsSM.n10 <- here::here("fitted_models", "model_brmsSM.n10.RData")
+
+if (REFIT_MODELS || !file.exists(PathBrmsSM.n10)) {
+
+model.brms.SM.n10 <- brm(
+    topkill|weights(weights) ~ firedrought + (1 | siteid),
+  data = dat.model.DSF,
+  family = bernoulli(),
+  chains = 4,
+  warmup = 1000,
+  iter = 5000,
+  control = list(adapt_delta = 0.99,
+                 max_treedepth = 14),
+  future = TRUE)
+
+plan(sequential)
+  
+
+save(model.brms.SM.n10, file = PathBrmsSM.n10)
+
+} else {
+  # Load previously fitted model
+  load(PathBrmsSM.n10)
+}
+
+
+
+summary(model.brms.SM.n10)
+```
+
+Model summary (similar to that from lme4::glmer). We only use this as a sanity check - not directly for inference.
+
+```{r}
+
+if (HAS_BRMS) {
+  summary(model.brms.SM.n10)
+}
+
+```
+
+These values are very similar to those produced by lme4::glmer.
+
+
+Graphical summaries of fitted parameters (densities and trace plots). Again these are mostly for model checking.
+
+```{r}
+
+if (HAS_BRMS) {
+  plot(model.brms.SM.n10, N=3, ask = FALSE, newpage = FALSE)
+}
+
+```
+
+
+
+## Models for DSF observations
+
+```{r}
+
+dat.model.WSF <- dat.model %>%
+  filter(vegtype == "wsf")
+
+
+```
+
+
+### model code
+
+```{r}
+
+library(future)
+
+plan(multiprocess)
+
+PathBrmsSM.n11 <- here::here("fitted_models", "model_brmsSM.n11.RData")
+
+if (REFIT_MODELS || !file.exists(PathBrmsSM.n11)) {
+
+model.brms.SM.n11 <- brm(
+    topkill|weights(weights) ~ firedrought + (1 | siteid),
+  data = dat.model.WSF,
+  family = bernoulli(),
+  chains = 4,
+  warmup = 1000,
+  iter = 5000,
+  control = list(adapt_delta = 0.99,
+                 max_treedepth = 14),
+  future = TRUE)
+
+plan(sequential)
+  
+
+save(model.brms.SM.n11, file = PathBrmsSM.n11)
+
+} else {
+  # Load previously fitted model
+  load(PathBrmsSM.n11)
+}
+
+
+
+summary(model.brms.SM.n11)
+```
+
+Model summary (similar to that from lme4::glmer). We only use this as a sanity check - not directly for inference.
+
+```{r}
+
+if (HAS_BRMS) {
+  summary(model.brms.SM.n11)
+}
+
+```
+
+These values are very similar to those produced by lme4::glmer.
+
+
+Graphical summaries of fitted parameters (densities and trace plots). Again these are mostly for model checking.
+
+```{r}
+
+if (HAS_BRMS) {
+  plot(model.brms.SM.n11, N=3, ask = FALSE, newpage = FALSE)
+}
+
+```
+
+
+
+### DSF predictions
+
+```{r}
+
+### create all unique combinations of variables (use expand.grid when cont. vars.)
+postSM.n10 <- expand.grid(
+  firedrought = levels(dat.model.DSF$firedrought)) %>%
+  
+### add fitted draws  
+  tidybayes::add_fitted_draws(model.brms.SM.n10, n = 3000, re_formula = NA) %>%
+  ungroup() %>%
+  
+### seperate pred. vars. for graphing and model queries
+
+  tidyr::separate(firedrought, c("fire", "drought"), sep = "\\.", remove = FALSE) %>%
+  
+
+    ## Change labels for plotting   
+  dplyr::mutate(drought = fct_recode(drought, 
+                                     "mild"   = "low", 
+                                     "severe" = "high")) %>%
+
+
+  select(iter = .draw, fire, drought, Probability = .value)
+
+  
+```
+
+
+```{r}
+
+
+effect1 <- postSM.n10 %>%
+  
+  tidyr::unite(drought_fire, drought, fire) %>%
+
+  
+  tidyr::spread(drought_fire, Probability)
+
+
+```
+
+
+
+```{r}
+
+head(effect1)
+
+```
+##means
+```{r}
+effect1 %>%
+  summarize(median(severe_high), median(severe_low), median(mild_high), median(mild_low))
+```
+
+
+
+```{r}
+## calculate probability estimates
+
+diffs <- effect1 %>%
+  mutate(diff_MD_LF = mild_low,
+         diff_MD_HF = mild_high,
+         diff_SD_LF = severe_low,
+         diff_SD_HF = severe_high) %>%
+  
+  select(starts_with("diff"))
+
+head(diffs)
+
+```
+
+```{r}
+## Calculate predicted difference
+
+## diff drought
+
+diffs1.a <- effect1 %>%
+  
+  mutate(diff_low = (severe_low -  mild_low),
+         diff_high = (severe_high - mild_high)) %>%
+  
+  select(starts_with("diff"))
+
+head(diffs1.a)
+
+## diffs fire
+diffs1.a2 <- effect1 %>%
+  
+  mutate(diff_severe = (severe_high -  severe_low),
+         diff_mild = (mild_high - mild_low)) %>%
+  
+  select(starts_with("diff"))
+
+head(diffs1.a2)
+```
+
+
+
+```{r}
+# convert to long format for ggplot
+dat.gg <- diffs %>%
+  tidyr::gather(var, diff) %>%
+  mutate(var = factor(str_replace(var, "diff_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/"))) %>%
+  mutate(var = factor(var, levels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF"), 
+                           labels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF")))
+
+#dat.gg$varfs<- interaction(
+ # dat.gg$var, dat.gg$firescar)
+
+  
+x.stats <- dat.gg %>%
+  group_by(var) %>%
+    summarize(mid = median(diff),
+            lwr95 = hpdi.vec(diff, 0.95)[1],
+            upr95 = hpdi.vec(diff, 0.95)[2],
+            lwr50 = hpdi.vec(diff, 0.50)[1],
+            upr50 = hpdi.vec(diff, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg1.a <- diffs1.a %>%
+  tidyr::gather(var, diff) %>%
+  mutate(var = factor(str_replace(var, "diff_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/"))) %>%
+    mutate(var = factor(var, levels = c("low", "high"), 
+                           labels = c("low", "high")))
+
+
+
+  
+x.stats1.a <- dat.gg1.a %>%
+  group_by(var) %>%
+    summarize(mid = median(diff),
+            lwr95 = hpdi.vec(diff, 0.95)[1],
+            upr95 = hpdi.vec(diff, 0.95)[2],
+            lwr50 = hpdi.vec(diff, 0.50)[1],
+            upr50 = hpdi.vec(diff, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg1.a2 <- diffs1.a2 %>%
+  tidyr::gather(var, diff) %>%
+  mutate(var = factor(str_replace(var, "diff_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats1.a2 <- dat.gg1.a2 %>%
+  group_by(var) %>%
+    summarize(mid = median(diff),
+            lwr95 = hpdi.vec(diff, 0.95)[1],
+            upr95 = hpdi.vec(diff, 0.95)[2],
+            lwr50 = hpdi.vec(diff, 0.50)[1],
+            upr50 = hpdi.vec(diff, 0.50)[2])
+
+
+```
+
+
+```{r fig.height = 3, fig.width = 3}
+#library(ggthemes)
+#set plot font for knit output
+
+#rhg_cols2 <- c("grey", "grey53", "grey30", "grey15")
+
+rhg_cols2 <- c("MD/LF" = "#1b9e77", "MD/HF" = "#d95f02", "SD/LF" = "#7570b3", "SD/HF" = "#e7298a")
+
+
+My_Theme = theme(
+  plot.title = element_text(size = 11.5, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11.5, face = "bold"),
+  axis.text.y = element_text(size = 9.5, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10.5, vjust = 0.9, hjust = 0.9, margin = unit(c(0.15, 0.1, 0.1, 0.1), "cm"), angle = 45),
+  axis.title.x = element_text(size = 11.5, face = "bold", vjust = -1.8),
+  strip.text.x = element_text(size = 10.5),
+  strip.text.y = element_text(size = 10.5),
+  strip.text = element_text(size = 10.5),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  strip.placement = "inside",
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  legend.position = "bottom",
+  legend.title = element_text(size = 8.5, hjust = 0.6, face = "bold"),
+  legend.text = element_text(size = 7.5),
+  legend.key.width = unit(0.5, "cm"),
+  legend.background = element_blank(),
+  plot.margin = unit(c(5.5, 4, 6.5, 4), "pt"))
+
+
+DSF.saplings <- ggplot(data = dat.gg, aes (x = var)) +
+  
+ My_Theme +
+  
+  
+  
+  geom_linerange(data = x.stats, aes(ymin = lwr95, ymax = upr95),
+               size = 0.5) +
+ 
+  geom_linerange(data = x.stats, aes(ymin = lwr50, ymax = upr50),
+               size = 5.75, show.legend = FALSE) +
+  
+  geom_linerange(data = x.stats, aes(ymin = lwr50+0.002, ymax = upr50-0.002),
+               size = 4.75, show.legend = FALSE, color = rhg_cols2) +
+ 
+ scale_color_manual(values = rhg_cols2) +
+  
+ 
+
+ 
+  labs(y = "", x = "", title = "DSF") +
+  
+  scale_y_continuous(labels = scales::percent_format(suffix = "", accuracy = 1), limits = c(0, 0.30), breaks = c(0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3)) +
+    coord_cartesian(ylim=c(0, 0.25)) 
+   
+   ggsave("DSF.RF.saplings.png")
+
+DSF.saplings
+ 
+```
+
+
+
+```{r}
+
+means <- dat.gg %>%
+  group_by(var) %>%
+  summarize(prob = median(diff))
+
+knitr::kable(means, digits = 3)
+
+```
+
+Summary of magnitude of differences based on 50% and 95% highest posterior density intervals.
+
+The `hpdi` function is defined in the setup code chunk at the beginning of this document.
+
+```{r}
+
+x <- dat.gg %>%
+  group_by(var) %>%
+  
+  summarize(lwr95 = hpdi.vec(diff, 0.95)[1],
+            lwr50 = hpdi.vec(diff, 0.5)[1],
+            mid = median(diff),
+            upr50 = hpdi.vec(diff, 0.5)[2],
+            upr95 = hpdi.vec(diff, 0.95)[2])
+
+knitr::kable(x, digits = 3)
+
+```
+
+difference graph
+
+```{r fig.height = 3, fig.width = 1.8}
+
+## colors for labels
+
+rhg_cols2 <- c("grey45", "grey15")
+
+## plot theme
+
+My_Theme = theme(
+  plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11, face = "bold", hjust = 0.5),
+  axis.text.y = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm"), color = rhg_cols2),
+  axis.title.x = element_text(size = 11, face = "bold"),
+  strip.text.x = element_text(size = 12),
+  strip.text.y = element_text(size = 12),
+  strip.text = element_text(face = "bold"),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  plot.margin = unit(c(5.5, 2, 1, 2), "pt"))
+
+
+DSF.sapling.diff.drought <- ggplot(data = x.stats1.a, aes (x = var)) +
+  
+  My_Theme +
+
+  geom_linerange(aes(ymin = lwr95, ymax = upr95),
+               size = 0.5, position = position_dodge(width = 0.6)) +
+ 
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, colour = var),
+               size = 5.0, show.legend = FALSE, position = position_dodge(width = 0.6)) +
+ 
+  scale_colour_manual(values = rhg_cols2) +
+  
+  labs(x = "Fire frequency", y = "\u0394 mortality due to drought (%)\n", title = NULL) +
+
+  
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  
+  theme(axis.text.y = element_text(size = 10), axis.title.y = element_text(size = 12)) +
+  
+
+  annotate("text", x = 1, y = -0.1, label = "20.2 %", size = 3, fontface = 2, color = "grey45") +
+  
+  annotate("text", x = 2, y = -0.1, label = "10.4 %", size = 3, fontface = 2, color = "grey15") +
+  
+  scale_y_continuous(labels = scales::percent_format(suffix = "", accuracy = 1), breaks = c(-0.1, 0, 0.1, 0.2, 0.3, 0.4), position = "left") +
+  coord_cartesian(ylim=c(-0.1, 0.4))    
+
+   ggsave("DSF.sapling.diff.drought.png")
+
+DSF.sapling.diff.drought
+ 
+```
+
+```{r fig.height = 3, fig.width = 1.8}
+
+## colors for labels
+
+rhg_cols2 <- c("grey45", "grey15")
+
+## plot theme
+
+My_Theme = theme(
+  plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11, face = "bold", hjust = 0.5),
+  axis.text.y = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm"), color = rhg_cols2),
+  axis.title.x = element_text(size = 11, face = "bold"),
+  strip.text.x = element_text(size = 12),
+  strip.text.y = element_text(size = 12),
+  strip.text = element_text(face = "bold"),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  plot.margin = unit(c(5.5, 2, 1, 2), "pt"))
+
+
+DSF.sapling.diff.fire <- ggplot(data = x.stats1.a2, aes (x = var)) +
+  
+  My_Theme +
+
+  geom_linerange(aes(ymin = lwr95, ymax = upr95),
+               size = 0.5, position = position_dodge(width = 0.6)) +
+ 
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, colour = var),
+               size = 5.0, show.legend = FALSE, position = position_dodge(width = 0.6)) +
+ 
+  scale_colour_manual(values = rhg_cols2) +
+ 
+  
+  labs(x = "Drought severity", y = "\u0394 mortality due to fire freq. (%)\n", title = NULL) +
+
+  
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  
+  theme(axis.text.y = element_text(size = 10), axis.title.y = element_text(size = 12)) +
+
+  annotate("text", x = 1, y = -0.3, label = "12 %", size = 3, fontface = 2, color = "grey45") +
+  
+  annotate("text", x = 2, y = -0.3, label = "2.2 %", size = 3, fontface = 2, color = "grey15") +
+  
+  scale_y_continuous(labels = scales::percent_format(suffix = "", accuracy = 1), breaks = c(-0.2, -0.1, 0, 0.1, 0.2, 0.3), position = "left") +
+  coord_cartesian(ylim=c(-0.2, 0.3))    
+
+   ggsave("DSF.sapling.diff.fire.png")
+
+DSF.sapling.diff.fire
+ 
+```
+
+diff drought
+
+```{r}
+means <- dat.gg1.a %>%
+  group_by(var) %>%
+  summarize(prob = median(diff))
+
+
+knitr::kable(means, digits = 3)
+```
+
+## diff fire
+
+```{r}
+means <- dat.gg1.a2 %>%
+  group_by(var) %>%
+  summarize(prob = median(diff))
+
+knitr::kable(means, digits = 3)
+```
+
+
+
+
+
+### WSF predictions
+
+```{r}
+
+### create all unique combinations of variables (use expand.grid when cont. vars.)
+postSM.n11 <- expand.grid(
+  firedrought = levels(dat.model.WSF$firedrought)) %>%
+  
+### add fitted draws  
+  tidybayes::add_fitted_draws(model.brms.SM.n11, n = 3000, re_formula = NA) %>%
+  ungroup() %>%
+  
+### seperate pred. vars. for graphing and model queries
+
+  tidyr::separate(firedrought, c("fire", "drought"), sep = "\\.", remove = FALSE) %>%
+  
+    ## Change labels for plotting   
+  dplyr::mutate(drought = fct_recode(drought, 
+                                     "mild"   = "low", 
+                                     "severe" = "high")) %>%
+
+
+  select(iter = .draw, fire, drought, Probability = .value)
+
+  
+```
+
+### saplings
+
+```{r}
+
+
+effect2 <- postSM.n11 %>%
+  
+  tidyr::unite(drought_fire, drought, fire) %>%
+
+  
+  tidyr::spread(drought_fire, Probability)
+
+
+```
+
+
+
+```{r}
+
+head(effect2)
+
+```
+##means
+```{r}
+effect2 %>%
+  summarize(median(severe_high), median(severe_low), median(mild_high), median(mild_low))
+```
+
+
+
+```{r}
+# calculate probability estimates
+
+diffs2 <- effect2 %>%
+  mutate(diff_MD_LF = mild_low,
+         diff_MD_HF = mild_high,
+         diff_SD_LF = severe_low,
+         diff_SD_HF = severe_high) %>%
+  
+  select(starts_with("diff"))
+
+head(diffs2)
+
+```
+
+
+```{r}
+## Calculate predicted difference
+
+## diff drought
+
+diffs2.a <- effect2 %>%
+  
+  mutate(diff_low = (severe_low -  mild_low),
+         diff_high = (severe_high - mild_high)) %>%
+  
+  select(starts_with("diff"))
+
+head(diffs2.a)
+
+
+## diff fire
+
+diffs2.a2 <- effect2 %>%
+  
+  mutate(diff_severe = (severe_high -  severe_low),
+         diff_mild = (mild_high - mild_low)) %>%
+  
+  select(starts_with("diff"))
+
+head(diffs2.a2)
+
+
+```
+
+
+
+
+```{r}
+# convert to long format for ggplot
+dat.gg2 <- diffs2 %>%
+  tidyr::gather(var, diff) %>%
+  mutate(var = factor(str_replace(var, "diff_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/"))) %>%
+  mutate(var = factor(var, levels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF"), 
+                           labels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF")))
+
+  
+x.stats2 <- dat.gg2 %>%
+  group_by(var) %>%
+    summarize(mid = median(diff),
+            lwr95 = hpdi.vec(diff, 0.95)[1],
+            upr95 = hpdi.vec(diff, 0.95)[2],
+            lwr50 = hpdi.vec(diff, 0.50)[1],
+            upr50 = hpdi.vec(diff, 0.50)[2])
+
+
+# convert to long format for ggplot
+dat.gg2.a <- diffs2.a %>%
+  tidyr::gather(var, diff) %>%
+  mutate(var = factor(str_replace(var, "diff_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/"))) %>%
+    mutate(var = factor(var, levels = c("low", "high"), 
+                             labels = c("low", "high")))
+
+
+
+  
+x.stats2.a <- dat.gg2.a %>%
+  group_by(var) %>%
+    summarize(mid = median(diff),
+            lwr95 = hpdi.vec(diff, 0.95)[1],
+            upr95 = hpdi.vec(diff, 0.95)[2],
+            lwr50 = hpdi.vec(diff, 0.50)[1],
+            upr50 = hpdi.vec(diff, 0.50)[2])
+
+dat.gg2.a2 <- diffs2.a2 %>%
+  tidyr::gather(var, diff) %>%
+  mutate(var = factor(str_replace(var, "diff_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats2.a2 <- dat.gg2.a2 %>%
+  group_by(var) %>%
+    summarize(mid = median(diff),
+            lwr95 = hpdi.vec(diff, 0.95)[1],
+            upr95 = hpdi.vec(diff, 0.95)[2],
+            lwr50 = hpdi.vec(diff, 0.50)[1],
+            upr50 = hpdi.vec(diff, 0.50)[2])
+
+
+
+```
+
+
+```{r fig.height = 3, fig.width = 3}
+#rhg_cols2 <- c("grey", "grey53", "grey30", "grey15")
+
+rhg_cols2 <- c("MD/LF" = "#1b9e77", "MD/HF" = "#d95f02", "SD/LF" = "#7570b3", "SD/HF" = "#e7298a")
+
+
+My_Theme = theme(
+  plot.title = element_text(size = 11.5, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11.5, face = "bold"),
+  axis.text.y = element_text(size = 9.5, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10.5, vjust = 0.9, hjust = 0.9, margin = unit(c(0.15, 0.1, 0.1, 0.1), "cm"), angle = 45),
+  axis.title.x = element_text(size = 11.5, face = "bold", vjust = -1.8),
+  strip.text.x = element_text(size = 10.5),
+  strip.text.y = element_text(size = 10.5),
+  strip.text = element_text(size = 10.5),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  strip.placement = "inside",
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  legend.position = "bottom",
+  legend.title = element_text(size = 8.5, hjust = 0.6, face = "bold"),
+  legend.text = element_text(size = 7.5),
+  legend.key.width = unit(0.5, "cm"),
+  legend.background = element_blank(),
+  plot.margin = unit(c(5.5, 4, 6.5, 4), "pt"))
+
+
+WSF.saplings <- ggplot(data = dat.gg2, aes (x = var)) +
+  
+ My_Theme +
+  
+  geom_linerange(data = x.stats2, aes(ymin = lwr95, ymax = upr95),
+               size = 0.5) +
+ 
+  geom_linerange(data = x.stats2, aes(ymin = lwr50, ymax = upr50),
+               size = 5.75, show.legend = FALSE) +
+  
+  geom_linerange(data = x.stats2, aes(ymin = lwr50+0.002, ymax = upr50-0.002),
+               size = 4.75, show.legend = FALSE, color = rhg_cols2) +
+ 
+ scale_color_manual(values = rhg_cols2) +
+ 
+
+  labs(y = "", x = "", title = "WSF") +
+  
+
+  scale_y_continuous(labels = scales::percent_format(suffix = "", accuracy = 1), limits = c(0, 0.30), breaks = c(0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3)) +
+      coord_cartesian(ylim=c(0, 0.25)) 
+   
+   ggsave("WSF.RF.saplings.png")
+
+WSF.saplings
+ 
+```
+
+
+
+```{r}
+
+means <- dat.gg2 %>%
+  group_by(var) %>%
+  summarize(prob = median(diff))
+
+knitr::kable(means, digits = 3)
+
+```
+
+Summary of magnitude of differences based on 50% and 95% highest posterior density intervals.
+
+The `hpdi` function is defined in the setup code chunk at the beginning of this document.
+
+```{r}
+
+x2 <- dat.gg2 %>%
+  group_by(var) %>%
+  
+  summarize(lwr95 = hpdi.vec(diff, 0.95)[1],
+            lwr50 = hpdi.vec(diff, 0.5)[1],
+            mid = median(diff),
+            upr50 = hpdi.vec(diff, 0.5)[2],
+            upr95 = hpdi.vec(diff, 0.95)[2])
+
+knitr::kable(x2, digits = 3)
+
+```
+
+difference graph
+
+```{r fig.height = 3, fig.width = 1.8}
+
+## colors for labels
+
+rhg_cols2 <- c("grey45", "grey15")
+
+## plot theme
+
+My_Theme = theme(
+  plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11, face = "bold", hjust = 0.5),
+  axis.text.y = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm"), color = rhg_cols2),
+  axis.title.x = element_text(size = 11, face = "bold"),
+  strip.text.x = element_text(size = 12),
+  strip.text.y = element_text(size = 12),
+  strip.text = element_text(face = "bold"),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  plot.margin = unit(c(5.5, 2, 1, 2), "pt"))
+
+
+WSF.sapling.diff.drought <- ggplot(data = x.stats2.a, aes (x = var)) +
+  
+  My_Theme +
+
+  geom_linerange(aes(ymin = lwr95, ymax = upr95),
+               size = 0.5, position = position_dodge(width = 0.6)) +
+ 
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, colour = var),
+               size = 5.0, show.legend = FALSE, position = position_dodge(width = 0.6)) +
+ 
+  scale_colour_manual(values = rhg_cols2) +
+ 
+  labs(x = "Fire frequency", y = "\u0394 mortality due to drought (%)\n", title = NULL) +
+
+  
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  
+  theme(axis.text.y = element_text(size = 10), axis.title.y = element_text(size = 12)) +
+  
+  annotate("text", x = 1, y = -0.5, label = "-24.1 %", size = 3, fontface = 2, color = "grey45") +
+  
+  annotate("text", x = 2, y = -0.5, label = "6.7 %", size = 3, fontface = 2, color = "grey15") +
+  
+  scale_y_continuous(labels = scales::percent_format(suffix = "", accuracy = 1), breaks = c(-0.5, -0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4), position = "left") +
+  coord_cartesian(ylim=c(-0.5, 0.4))    
+
+   ggsave("WSF.sapling.diff.drought.png")
+
+WSF.sapling.diff.drought
+ 
+```
+
+```{r fig.height = 3, fig.width = 1.8}
+
+## colors for labels
+
+rhg_cols2 <- c("grey45", "grey15")
+
+## plot theme
+
+My_Theme = theme(
+  plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11, face = "bold", hjust = 0.5),
+  axis.text.y = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm"), color = rhg_cols2),
+  axis.title.x = element_text(size = 11, face = "bold"),
+  strip.text.x = element_text(size = 12),
+  strip.text.y = element_text(size = 12),
+  strip.text = element_text(face = "bold"),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  plot.margin = unit(c(5.5, 2, 1, 2), "pt"))
+
+
+WSF.sapling.diff.fire <- ggplot(data = x.stats2.a2, aes (x = var)) +
+  
+  My_Theme +
+
+  geom_linerange(aes(ymin = lwr95, ymax = upr95),
+               size = 0.5, position = position_dodge(width = 0.6)) +
+ 
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, colour = var),
+               size = 5.0, show.legend = FALSE, position = position_dodge(width = 0.6)) +
+ 
+  scale_colour_manual(values = rhg_cols2) +
+ 
+  labs(x = "Drought severity", y = "\u0394 mortality due to fire freq. (%)\n", title = NULL) +
+
+  
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  
+  theme(axis.text.y = element_text(size = 10), axis.title.y = element_text(size = 12)) +
+  
+  annotate("text", x = 1, y = -0.4, label = "-5.1 %", size = 3, fontface = 2, color = "grey45") +
+  
+  annotate("text", x = 2, y = -0.4, label = "25.7 %", size = 3, fontface = 2, color = "grey15") +
+  
+  scale_y_continuous(labels = scales::percent_format(suffix = "", accuracy = 1), breaks = c(-0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4, 0.5), position = "left") +
+  coord_cartesian(ylim=c(-0.4, 0.5))    
+
+   ggsave("WSF.sapling.diff.fire.png")
+
+WSF.sapling.diff.fire
+ 
+```
+
+## diff drought
+
+```{r}
+means <- dat.gg2.a %>%
+  group_by(var) %>%
+  summarize(prob = median(diff))
+
+knitr::kable(means, digits = 3)
+```
+
+## diff fire
+
+```{r}
+means <- dat.gg2.a2 %>%
+  group_by(var) %>%
+  summarize(prob = median(diff))
+
+knitr::kable(means, digits = 3)
+```
+
